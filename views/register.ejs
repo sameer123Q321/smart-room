@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add Face</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-pin-required="<%= pinRequired %>">
+<main class="narrow">
+  <header>
+    <div>
+      <a href="/" class="back">&larr; Dashboard</a>
+      <h1>Add a face</h1>
+      <div class="sub">5 quick photos from different angles, so the door camera knows this person</div>
+    </div>
+  </header>
+
+  <section id="form">
+    <div class="card">
+      <label class="label" for="name">Name</label>
+      <input id="name" class="input" placeholder="e.g. Ali" maxlength="40" autocomplete="off">
+    </div>
+
+    <div class="card cam-card">
+      <div id="cam" class="cam">
+        <video id="video" playsinline muted></video>
+        <div id="guide" class="cam-guide"></div>
+        <div id="arrow" class="cam-arrow" aria-hidden="true"></div>
+        <div id="flash" class="cam-flash"></div>
+        <div id="camStart" class="cam-start">
+          <button id="startBtn" class="btn" type="button">Start camera</button>
+          <p id="camNote" class="control-msg">Good light on your face helps a lot</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div id="stepTitle" class="step-title">Press "Start camera" to begin</div>
+        <div id="stepHint" class="control-msg">Photos are taken automatically when you're in position</div>
+      </div>
+
+      <div id="shots" class="shots"></div>
+
+      <div class="cam-actions">
+        <button id="captureBtn" class="btn btn-secondary" type="button" disabled>Take photo now</button>
+        <button id="saveBtn" class="btn" type="button" disabled>Save face</button>
+      </div>
+      <div id="saveMsg" class="save-msg" role="alert"></div>
+
+      <div class="upload-alt">
+        Camera not working?
+        <label class="link">Upload photos instead<input id="fileInput" type="file" accept="image/*" multiple hidden></label>
+      </div>
+    </div>
+  </section>
+
+  <section id="done" class="card done" hidden>
+    <div class="done-icon">✓</div>
+    <div id="doneText" class="step-title"></div>
+    <p class="control-msg">They can now open the door by turning on the switch at the door camera and looking at it.</p>
+    <div class="cam-actions">
+      <a href="/register" class="btn btn-secondary">Add another</a>
+      <a href="/" class="btn">Back to dashboard</a>
+    </div>
+  </section>
+</main>
+
+<script src="/vendor/face-api/face-api.js"></script>
+<script src="/pin.js"></script>
+<script src="/register.js"></script>
+</body>
+</html>

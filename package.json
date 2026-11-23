@@ -1,0 +1,24 @@
+{
+  "name": "smart-room-server",
+  "version": "1.0.0",
+  "description": "Smart room dashboard: ESP32 readings, door lock, light, fan and face recognition at the door",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "setup": "node scripts/setup-models.js",
+    "postinstall": "node scripts/setup-models.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vladmandic/face-api": "^1.7.15",
+    "adm-zip": "^0.6.1",
+    "ejs": "^7.0.2",
+    "express": "^5.3.0",
+    "jpeg-js": "^0.4.4",
+    "onnxruntime-node": "1.30.0"
+  }
+}

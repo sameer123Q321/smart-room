@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0f17" media="(prefers-color-scheme: dark)">
+<title>History</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="history">
+  <header>
+    <div>
+      <a href="/" class="back">&larr; Dashboard</a>
+      <h1>History</h1>
+      <div class="sub">Who came in, and when</div>
+    </div>
+  </header>
+
+  <section class="summary">
+    <div class="card summary-tile">
+      <div class="muted-small">Came in today</div>
+      <div id="sumEntries" class="summary-value good">0</div>
+    </div>
+    <div class="card summary-tile">
+      <div class="muted-small">Not let in today</div>
+      <div id="sumUnknown" class="summary-value bad">0</div>
+    </div>
+    <div class="card summary-tile">
+      <div class="muted-small">Registered people</div>
+      <div id="sumPeople" class="summary-value">0</div>
+    </div>
+  </section>
+
+  <h2 class="section-title">People</h2>
+  <div id="people" class="people-strip" role="group" aria-label="Show one person"></div>
+
+  <div class="history-head">
+    <h2 class="section-title">Timeline</h2>
+    <div id="filters" class="segmented" role="group" aria-label="Filter">
+      <button type="button" data-group="" class="active">All</button>
+      <button type="button" data-group="entries">Came in</button>
+      <button type="button" data-group="unknown">Not let in</button>
+    </div>
+  </div>
+
+  <section class="card timeline-card">
+    <div id="timeline"></div>
+    <div id="empty" class="timeline-empty" hidden>
+      <div class="visit-empty-title">Nothing here yet</div>
+      <div class="muted-small">Entries appear when someone uses the door camera or opens the door from the dashboard.</div>
+    </div>
+    <button id="moreBtn" class="btn btn-secondary btn-block" type="button" hidden>Show older</button>
+  </section>
+</main>
+
+<dialog id="photoDialog" class="photo-dialog">
+  <img id="photoBig" alt="Photo from the door camera">
+  <div class="photo-caption">
+    <div>
+      <div id="photoTitle" class="event-title"></div>
+      <div id="photoTime" class="muted-small"></div>
+    </div>
+    <button id="photoClose" class="btn btn-small btn-secondary" type="button">Close</button>
+  </div>
+</dialog>
+
+<script src="/activity.js"></script>
+<script src="/history.js"></script>
+</body>
+</html>

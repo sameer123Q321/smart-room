@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0f17" media="(prefers-color-scheme: dark)">
+<title>Smart Room</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<%
+  // Small line icons (24x24, drawn with the text colour)
+  const svg = (paths) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+  const icon = {
+    home:    svg('<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>'),
+    thermo:  svg('<path d="M14 14.76V4a2 2 0 0 0-4 0v10.76a4 4 0 1 0 4 0z"/><path d="M12 9v7"/>'),
+    drop:    svg('<path d="M12 3s-6 6.5-6 11a6 6 0 0 0 12 0c0-4.5-6-11-6-11z"/>'),
+    feel:    svg('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
+    tip:     svg('<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.7.5 1.1 1.3 1.1 2.2h5c0-.9.4-1.7 1.1-2.2A6 6 0 0 0 12 3z"/>'),
+    lock:    svg('<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/>'),
+    unlock:  svg('<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5"/><path d="M8 10.5V7a4 4 0 0 1 7.7-1.5"/>'),
+    light:   svg('<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.7.5 1.1 1.3 1.1 2.2h5c0-.9.4-1.7 1.1-2.2A6 6 0 0 0 12 3z"/>'),
+    fan:     svg('<circle cx="12" cy="12" r="1.8"/><path d="M12 10.2C11 6 12 3 14.6 3c2 0 2.7 2.4.6 4.3L12 10.2zM13.8 12c4.2-1 7.2 0 7.2 2.6 0 2-2.4 2.7-4.3.6L13.8 12zM12 13.8c1 4.2 0 7.2-2.6 7.2-2 0-2.7-2.4-.6-4.3l3.2-2.9zM10.2 12C6 13 3 12 3 9.4c0-2 2.4-2.7 4.3-.6l2.9 3.2z"/>'),
+    power:   svg('<path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/>'),
+    camera:  svg('<path d="M4 7.5h3l1.8-2.5h6.4L17 7.5h3a1 1 0 0 1 1 1V19a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8.5a1 1 0 0 1 1-1z"/><circle cx="12" cy="13.2" r="3.6"/>'),
+    faces:   svg('<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18.5 14.3A6.5 6.5 0 0 1 21.5 20"/>'),
+    plus:    svg('<path d="M12 5v14M5 12h14"/>'),
+    history: svg('<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>')
+  };
+
+  const doorState = !door.online ? "offline" : door.open ? "unlocked" : "locked";
+  const doorText = { offline: "Offline", unlocked: "Unlocked", locked: "Locked" }[doorState];
+  const chip = (text) => text ? `chip ${STATUS_CLASS[text] || ""}` : "chip";
+%>
+<body data-pin-required="<%= pinRequired %>">
+<main class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon"><%- icon.home %></div>
+      <div>
+        <h1>Smart Room</h1>
+        <div id="greeting" class="sub">Welcome home</div>
+      </div>
+    </div>
+    <% if (!latest) { %>
+      <div id="conn" class="pill"><span class="dot"></span><span id="connText">Connecting...</span></div>
+    <% } else { %>
+      <div id="conn" class="pill <%= live ? 'live' : 'offline' %>"><span class="dot"></span><span id="connText"><%= live ? 'Live' : 'Sensor offline' %></span></div>
+    <% } %>
+  </header>
+
+  <!-- Climate -->
+  <section class="card climate" aria-label="Room climate">
+    <div class="climate-main">
+      <div class="label-row"><span class="label-icon"><%- icon.thermo %></span>Temperature</div>
+      <div class="big-value"><span id="temp"><%= fmt(latest && latest.temperature, 1) %></span><span class="big-unit">°C</span></div>
+      <span id="tempStatus" class="<%= chip(latest && latest.tempStatus) %>"><%= latest ? latest.tempStatus : '' %></span>
+    </div>
+
+    <div class="climate-stats">
+      <div class="stat">
+        <div class="label-row"><span class="label-icon"><%- icon.drop %></span>Humidity</div>
+        <div class="stat-value"><span id="hum"><%= fmt(latest && latest.humidity, 0) %></span><span class="stat-unit">%</span></div>
+        <div class="meter" aria-hidden="true"><span id="humBar" style="width: <%= latest ? Math.min(100, latest.humidity) : 0 %>%"></span></div>
+        <span id="humStatus" class="<%= chip(latest && latest.humidityStatus) %>"><%= latest ? latest.humidityStatus : '' %></span>
+      </div>
+      <div class="stat">
+        <div class="label-row"><span class="label-icon"><%- icon.feel %></span>Feels like</div>
+        <div class="stat-value"><span id="feels"><%= fmt(latest && latest.feelsLike, 1) %></span><span class="stat-unit">°C</span></div>
+        <div class="meter meter-temp" aria-hidden="true"><span id="feelsBar" style="width: <%= latest ? Math.max(0, Math.min(100, (latest.feelsLike - 10) / 30 * 100)) : 0 %>%"></span></div>
+      </div>
+    </div>
+
+    <div class="advice">
+      <span class="advice-icon"><%- icon.tip %></span>
+      <span id="advice" class="advice-text"><%= latest && latest.advice ? latest.advice : 'Waiting for the first reading...' %></span>
+      <button id="adviceBtn" class="btn btn-small" type="button" hidden></button>
+    </div>
+  </section>
+
+  <!-- Devices -->
+  <h2 class="section-title">Devices</h2>
+  <section class="devices">
+    <div id="doorTile" class="tile door-tile" data-state="<%= doorState %>">
+      <div class="tile-top">
+        <span class="tile-icon"><span class="icon-locked"><%- icon.lock %></span><span class="icon-unlocked"><%- icon.unlock %></span></span>
+      </div>
+      <div class="tile-name">Door</div>
+      <div id="doorState" class="tile-state"><%= doorText %></div>
+      <div id="doorMsg" class="tile-msg"><%= door.online ? '' : 'The door lock is not connected' %></div>
+      <div class="countdown" aria-hidden="true"><span id="doorBar"></span></div>
+      <button id="doorBtn" class="btn btn-block" type="button" <%= door.online ? '' : 'disabled' %>>Open door</button>
+    </div>
+
+    <% for (const [name, s] of Object.entries(switches)) { %>
+      <button id="<%= name %>Btn" class="tile switch-tile<%= s.on ? ' on' : '' %>" type="button"
+              data-switch="<%= name %>" data-label="<%= switchLabels[name] %>"
+              aria-pressed="<%= s.on %>" <%= s.online ? '' : 'disabled' %>>
+        <span class="tile-top">
+          <span class="tile-icon icon-<%= name %>"><%- icon[name] || icon.power %></span>
+          <span class="toggle" aria-hidden="true"><span class="knob"></span></span>
+        </span>
+        <span class="tile-name"><%= switchLabels[name] %></span>
+        <span id="<%= name %>State" class="tile-state"><%= !s.online ? 'Offline' : s.on ? 'On' : 'Off' %></span>
+        <span id="<%= name %>Msg" class="tile-msg"><%= s.online ? 'Tap to switch' : 'Not connected' %></span>
+      </button>
+    <% } %>
+  </section>
+
+  <!-- Door camera + faces -->
+  <h2 class="section-title">Front door</h2>
+  <section class="door-grid">
+    <div class="card camera-card">
+      <div class="card-head">
+        <div class="label-row"><span class="label-icon"><%- icon.camera %></span>Door camera</div>
+        <span id="visitTime" class="muted-small"></span>
+      </div>
+
+      <div id="visitEmpty" class="visit-empty">
+        <span class="visit-empty-icon"><%- icon.camera %></span>
+        <div class="visit-empty-title">No visitors yet</div>
+        <div class="muted-small">Turn on the switch at the door camera to take a photo</div>
+      </div>
+
+      <div id="visit" class="visit" hidden>
+        <a id="visitLink" class="visit-photo" target="_blank" rel="noopener">
+          <img id="visitPhoto" alt="Last photo from the door camera">
+        </a>
+        <div id="visitResult" class="visit-result"></div>
+        <div id="visitSave" class="visit-save" hidden>
+          <span class="muted-small">Is this someone you know? Save their face so the camera recognises them next time.</span>
+          <div class="visit-save-row">
+            <select id="visitPerson" class="input input-small" aria-label="Person"></select>
+            <button id="visitSaveBtn" class="btn btn-small" type="button">Save face</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card faces-card">
+        <div class="card-head">
+          <div class="label-row"><span class="label-icon"><%- icon.faces %></span>Faces that open the door</div>
+          <a href="/register" class="btn btn-small btn-icon"><%- icon.plus %>Add face</a>
+        </div>
+        <div id="faceList" class="face-list"></div>
+      </div>
+
+      <div class="card activity-card">
+        <div class="card-head">
+          <div class="label-row"><span class="label-icon"><%- icon.history %></span>Recent activity</div>
+          <a href="/history" class="link-arrow">See all &rarr;</a>
+        </div>
+        <div id="activityList" class="activity-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer id="updated" class="updated"><% if (latest) { %>Last update: <%= ago(age) %><% } %></footer>
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="/pin.js"></script>
+<script src="/activity.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
