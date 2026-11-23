@@ -691,3 +691,8 @@ server.on("error", (err) => {
   }
   process.exit(1);
 });
+
+faceEngine.init()
+  .then(updateOldFaces)
+  .then(() => console.log("Face recognition ready."))
+  .catch((err) => console.error("Face recognition could not start:", err.message));
