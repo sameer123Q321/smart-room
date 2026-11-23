@@ -1,18 +1,8 @@
 
-// Smart Room server (Express + EJS)
-// Render-compatible version
-//
-// Install: npm install
-// Run:     npm start
-//
-// ESP32 endpoint:
-// https://smart-room-exsy.onrender.com/rpc
-
 const express = require("express");
 const path = require("path");
-const fs = require("fs");
 const crypto = require("crypto");
-const faceEngine = require("./face-engine");
+const supabase = require("./supabase");
 
 const app = express();
 
@@ -22,48 +12,46 @@ const HOST = "0.0.0.0";
 const OFFLINE_AFTER_MS = 15000;
 const DEVICES_OFFLINE_AFTER_MS = 5000;
 
-// Face recognition is disabled by default on Render Free.
-// Enable only after configuring and testing the face engine.
-const FACE_RECOGNITION_ENABLED =
-  process.env.FACE_RECOGNITION_ENABLED === "true";
+const DOOR_PIN = process.env.DOOR_PIN;
+const CAMERA_KEY = process.env.CAMERA_KEY;
+const LAPTOP_AGENT_KEY = process.env.LAPTOP_AGENT_KEY;
+
+const UNLOCK_MS = 3000;
+const REQUEST_EXPIRES_MS = 5000;
+const LIGHT_ON_WHEN_DOOR_OPENS = true;
+
+const REGISTERED_BUCKET = "registered-faces";
+const ATTEMPTS_BUCKET = "camera-attempts";
+
+if (!DOOR_PIN || !CAMERA_KEY || !LAPTOP_AGENT_KEY) {
+  throw new Error(
+    "Missing DOOR_PIN, CAMERA_KEY or LAPTOP_AGENT_KEY environment variable"
+  );
+}
 
 let latest = null;
 let espLastSeen = 0;
 
-// ---------- Security settings ----------
+const door = {
+  requestedAt: 0,
+  unlockUntil: 0,
+  open: false
+};
 
-const DOOR_PIN = process.env.DOOR_PIN || "1234";
+let wrongPins = 0;
+let pinBlockedUntil = 0;
 
-const CAMERA_KEY =
-  process.env.CAMERA_KEY || "smart-room-cam";
+const switches = {
+  light: { label: "Light", want: false, on: false },
+  fan: { label: "Fan", want: false, on: false }
+};
 
-const UNLOCK_MS = 3000;
-const REQUEST_EXPIRES_MS = 5000;
-
-const LIGHT_ON_WHEN_DOOR_OPENS = true;
-
-const FACE_MATCH_THRESHOLD = faceEngine.MATCH_DISTANCE;
-
-const MAX_VISITS = 20;
-const MAX_ACTIVITY = 500;
-
-// ---------- Data directories ----------
-
-const DATA_DIR = path.join(__dirname, "data");
-
-const FACES_FILE = path.join(DATA_DIR, "faces.json");
-const ACTIVITY_FILE = path.join(DATA_DIR, "activity.json");
-
-const FACE_PHOTO_DIR = path.join(DATA_DIR, "faces");
-const VISIT_PHOTO_DIR = path.join(DATA_DIR, "visits");
-
-fs.mkdirSync(FACE_PHOTO_DIR, { recursive: true });
-fs.mkdirSync(VISIT_PHOTO_DIR, { recursive: true });
-
-// ---------- Helpers ----------
+// --------------------------------------------------
+// GENERAL HELPERS
+// --------------------------------------------------
 
 function newId() {
-  return crypto.randomBytes(6).toString("hex");
+  return crypto.randomBytes(12).toString("hex");
 }
 
 function toNumber(value) {
@@ -72,33 +60,12 @@ function toNumber(value) {
 }
 
 function toText(value) {
-  return value === undefined || value === null
-    ? ""
-    : String(value).slice(0, 100);
-}
-
-function cleanIp(ip) {
-  return (ip || "").replace(/^::ffff:/, "");
+  return value == null ? "" : String(value).slice(0, 100);
 }
 
 function devicesOnline(now = Date.now()) {
   return now - espLastSeen < DEVICES_OFFLINE_AFTER_MS;
 }
-
-function isFaceEngineReady() {
-  return FACE_RECOGNITION_ENABLED && faceEngine.isReady();
-}
-
-// ---------- Door lock ----------
-
-const door = {
-  requestedAt: 0,
-  unlockUntil: 0,
-  open: false,
-};
-
-let wrongPins = 0;
-let pinBlockedUntil = 0;
 
 function doorRequested(now) {
   return (
@@ -107,193 +74,185 @@ function doorRequested(now) {
   );
 }
 
-function doorState(now) {
+function doorState(now = Date.now()) {
   return {
     online: devicesOnline(now),
     open: door.open,
     remainingMs: doorRequested(now)
       ? UNLOCK_MS
       : Math.max(0, door.unlockUntil - now),
-    pinRequired: DOOR_PIN !== "",
+    pinRequired: true
   };
 }
 
-// ---------- Switches ----------
+function switchStates(now = Date.now()) {
+  const result = {};
 
-const switches = {
-  light: {
-    label: "Light",
-    want: false,
-    on: false,
-  },
-
-  fan: {
-    label: "Fan",
-    want: false,
-    on: false,
-  },
-};
-
-function switchStates(now) {
-  const states = {};
-
-  for (const [name, s] of Object.entries(switches)) {
-    states[name] = {
+  for (const [name, item] of Object.entries(switches)) {
+    result[name] = {
       online: devicesOnline(now),
-      want: s.want,
-      on: s.on,
+      want: item.want,
+      on: item.on
     };
   }
 
-  return states;
-}
-
-// ---------- Faces and activity ----------
-
-let people = [];
-
-try {
-  people = JSON.parse(fs.readFileSync(FACES_FILE, "utf8"));
-} catch {
-  people = [];
-}
-
-let activity = [];
-
-try {
-  activity = JSON.parse(fs.readFileSync(ACTIVITY_FILE, "utf8"));
-} catch {
-  activity = [];
-}
-
-const visits = [];
-
-function savePeople() {
-  fs.writeFileSync(FACES_FILE, JSON.stringify(people));
-}
-
-function logActivity(entry) {
-  activity.unshift({
-    id: newId(),
-    time: Date.now(),
-    name: "",
-    personId: null,
-    photo: false,
-    ...entry,
-  });
-
-  while (activity.length > MAX_ACTIVITY) {
-    const old = activity.pop();
-
-    if (old.photo) {
-      fs.rmSync(
-        path.join(VISIT_PHOTO_DIR, old.id + ".jpg"),
-        { force: true }
-      );
-    }
-  }
-
-  fs.writeFileSync(ACTIVITY_FILE, JSON.stringify(activity));
-}
-
-function activityInfo(a) {
-  return {
-    id: a.id,
-    time: a.time,
-    type: a.type,
-    name: a.name,
-    personId: a.personId,
-    photo: a.photo ? `/visits/${a.id}.jpg` : null,
-  };
-}
-
-function visitInfo(v) {
-  if (!v) return null;
-
-  return {
-    id: v.id,
-    time: v.time,
-    result: v.result,
-    name: v.name,
-    hasFace: !!v.descriptor,
-    photo: `/visits/${v.id}.jpg`,
-  };
-}
-
-function closestPerson(descriptor) {
-  let best = null;
-
-  for (const person of people) {
-    for (const d of person.descriptors || []) {
-      if (d.length !== descriptor.length) continue;
-
-      const dist = faceEngine.distance(descriptor, d);
-
-      if (!best || dist < best.distance) {
-        best = {
-          person,
-          distance: dist,
-        };
-      }
-    }
-  }
-
-  return best;
-}
-
-function peopleList() {
-  return people.map((p) => {
-    const entries = activity.filter(
-      (a) => a.type === "entered" && a.personId === p.id
-    );
-
-    return {
-      id: p.id,
-      name: p.name,
-      photos: (p.descriptors || []).length,
-      entries: entries.length,
-      lastSeen: entries.length ? entries[0].time : null,
-    };
-  });
+  return result;
 }
 
 function dataUrlToJpeg(value) {
-  const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(
-    typeof value === "string" ? value : ""
-  );
+  const match =
+    /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(
+      typeof value === "string" ? value : ""
+    );
 
-  return m ? Buffer.from(m[1], "base64") : null;
+  if (!match) return null;
+
+  const buffer = Buffer.from(match[1], "base64");
+
+  if (
+    buffer.length < 4 ||
+    buffer[0] !== 0xff ||
+    buffer[1] !== 0xd8
+  ) {
+    return null;
+  }
+
+  return buffer;
 }
 
-// ---------- Express setup ----------
+function validJpeg(buffer) {
+  return (
+    Buffer.isBuffer(buffer) &&
+    buffer.length >= 4 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[buffer.length - 2] === 0xff &&
+    buffer[buffer.length - 1] === 0xd9
+  );
+}
+
+function safeEqual(a, b) {
+  const first = Buffer.from(String(a || ""));
+  const second = Buffer.from(String(b || ""));
+
+  return (
+    first.length === second.length &&
+    crypto.timingSafeEqual(first, second)
+  );
+}
+
+function agentAuth(req, res, next) {
+  if (
+    !safeEqual(
+      req.get("X-Laptop-Agent-Key"),
+      LAPTOP_AGENT_KEY
+    )
+  ) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized laptop agent"
+    });
+  }
+
+  next();
+}
+
+function cameraAuth(req, res, next) {
+  if (!safeEqual(req.get("X-Camera-Key"), CAMERA_KEY)) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized camera"
+    });
+  }
+
+  next();
+}
+
+function pinOk(req, res) {
+  const now = Date.now();
+
+  if (now < pinBlockedUntil) {
+    res.status(429).json({
+      ok: false,
+      error: "Too many wrong PINs. Try again in a minute."
+    });
+
+    return false;
+  }
+
+  if (
+    !safeEqual(
+      (req.body || {}).pin,
+      DOOR_PIN
+    )
+  ) {
+    wrongPins++;
+
+    if (wrongPins >= 5) {
+      pinBlockedUntil = now + 60000;
+      wrongPins = 0;
+    }
+
+    res.status(401).json({
+      ok: false,
+      error: "Wrong PIN"
+    });
+
+    return false;
+  }
+
+  wrongPins = 0;
+  return true;
+}
+
+async function logActivity(entry) {
+  const row = {
+    id: newId(),
+    event_type: entry.type,
+    person_id: entry.personId || null,
+    person_name: entry.name || "",
+    photo_path: entry.photoPath || null,
+    details: entry.details || {},
+    created_at: new Date().toISOString()
+  };
+
+  const { error } = await supabase
+    .from("activity_events")
+    .insert(row);
+
+  if (error) {
+    console.error("Activity database error:", error.message);
+  }
+
+  return row;
+}
+
+async function signedPhoto(bucket, storagePath) {
+  if (!storagePath) return null;
+
+  const { data, error } = await supabase.storage
+    .from(bucket)
+    .createSignedUrl(storagePath, 3600);
+
+  if (error) {
+    console.error("Signed URL error:", error.message);
+    return null;
+  }
+
+  return data.signedUrl;
+}
+
+// --------------------------------------------------
+// EXPRESS SETUP
+// --------------------------------------------------
 
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
 
-app.use(
-  "/api/faces",
-  express.json({ limit: "15mb" })
-);
+app.use("/api/faces", express.json({ limit: "15mb" }));
+app.use(express.json({ limit: "10kb" }));
 
-app.use(
-  express.json({ limit: "10kb" })
-);
-
-app.use(
-  express.static(path.join(__dirname, "public"))
-);
-
-app.use(
-  "/visits",
-  express.static(VISIT_PHOTO_DIR)
-);
-
-app.use(
-  "/face-photos",
-  express.static(FACE_PHOTO_DIR)
-);
-
-// Face API browser files
+app.use(express.static(path.join(__dirname, "public")));
 
 const FACE_API_DIR = path.join(
   __dirname,
@@ -312,7 +271,9 @@ app.use(
   express.static(path.join(FACE_API_DIR, "model"))
 );
 
-// ---------- EJS helpers ----------
+// --------------------------------------------------
+// EJS HELPERS
+// --------------------------------------------------
 
 app.locals.STATUS_CLASS = {
   Comfortable: "good",
@@ -323,36 +284,35 @@ app.locals.STATUS_CLASS = {
   Hot: "bad",
   "Too hot": "bad",
   "Too humid": "bad",
-  Cold: "cold",
+  Cold: "cold"
 };
 
 app.locals.fmt = (n, digits) =>
   typeof n === "number" ? n.toFixed(digits) : "--";
 
 app.locals.ago = (ms) => {
-  const s = Math.max(0, Math.round(ms / 1000));
+  const seconds = Math.max(0, Math.round(ms / 1000));
 
-  if (s < 60) return s + " s ago";
+  if (seconds < 60) return seconds + " s ago";
 
-  const m = Math.floor(s / 60);
+  const minutes = Math.floor(seconds / 60);
 
-  if (m < 60) return m + " min ago";
+  if (minutes < 60) return minutes + " min ago";
 
-  return Math.floor(m / 60) + " h ago";
+  return Math.floor(minutes / 60) + " h ago";
 };
 
-// ---------- JSON-RPC ----------
+// --------------------------------------------------
+// JSON-RPC FOR ESP32
+// --------------------------------------------------
 
 function rpcError(code, message) {
-  const err = new Error(message);
-  err.rpcCode = code;
-  return err;
+  const error = new Error(message);
+  error.rpcCode = code;
+  return error;
 }
 
 const rpcMethods = {
-
-  // ESP32 sends temperature and humidity readings.
-
   "room.report"(params, req) {
     const reading = {
       temperature: toNumber(params.temperature),
@@ -362,7 +322,10 @@ const rpcMethods = {
       humidityStatus: toText(params.humidityStatus),
       advice: toText(params.advice),
       time: Date.now(),
-      from: cleanIp(req.socket.remoteAddress),
+      from: (req.socket.remoteAddress || "").replace(
+        /^::ffff:/,
+        ""
+      )
     };
 
     if (
@@ -375,27 +338,10 @@ const rpcMethods = {
       );
     }
 
-    const changed =
-      !latest ||
-      latest.temperature !== reading.temperature ||
-      latest.humidity !== reading.humidity ||
-      latest.advice !== reading.advice;
-
     latest = reading;
-
-    if (changed) {
-      console.log(
-        `[${new Date().toLocaleTimeString()}] ` +
-        `${reading.temperature} C, ` +
-        `${reading.humidity} %, ` +
-        `feels ${reading.feelsLike} C - ${reading.advice}`
-      );
-    }
 
     return true;
   },
-
-  // ESP32 checks whether the door should unlock.
 
   "door.check"(params) {
     const now = Date.now();
@@ -411,27 +357,21 @@ const rpcMethods = {
         !switches.light.want
       ) {
         switches.light.want = true;
-
-        console.log(
-          "Light turned on because the door opened"
-        );
       }
     }
 
     return {
-      unlockMs: Math.max(0, door.unlockUntil - now),
+      unlockMs: Math.max(0, door.unlockUntil - now)
     };
-  },
+  }
 };
 
-// Light and fan checks.
-
-for (const [name, s] of Object.entries(switches)) {
+for (const [name, item] of Object.entries(switches)) {
   rpcMethods[name + ".check"] = (params) => {
-    s.on = params.on === true;
+    item.on = params.on === true;
 
     return {
-      on: s.want,
+      on: item.want
     };
   };
 }
@@ -453,8 +393,8 @@ function runRpcCall(call, req) {
       id,
       error: {
         code: -32600,
-        message: "Invalid request",
-      },
+        message: "Invalid request"
+      }
     };
   }
 
@@ -466,8 +406,8 @@ function runRpcCall(call, req) {
       id,
       error: {
         code: -32601,
-        message: "Method not found",
-      },
+        message: "Method not found"
+      }
     };
   } else {
     try {
@@ -477,18 +417,18 @@ function runRpcCall(call, req) {
         result: rpcMethods[call.method](
           call.params || {},
           req
-        ),
+        )
       };
-    } catch (err) {
-      if (!err.rpcCode) throw err;
+    } catch (error) {
+      if (!error.rpcCode) throw error;
 
       reply = {
         jsonrpc: "2.0",
         id,
         error: {
-          code: err.rpcCode,
-          message: err.message,
-        },
+          code: error.rpcCode,
+          message: error.message
+        }
       };
     }
   }
@@ -496,9 +436,9 @@ function runRpcCall(call, req) {
   return call.id === undefined ? null : reply;
 }
 
-// ESP32 sends all four requests to this endpoint.
-
 app.post("/rpc", (req, res) => {
+  espLastSeen = Date.now();
+
   const body = req.body;
 
   if (Array.isArray(body)) {
@@ -508,8 +448,8 @@ app.post("/rpc", (req, res) => {
         id: null,
         error: {
           code: -32600,
-          message: "Invalid request",
-        },
+          message: "Invalid request"
+        }
       });
     }
 
@@ -517,64 +457,23 @@ app.post("/rpc", (req, res) => {
       .map((call) => runRpcCall(call, req))
       .filter(Boolean);
 
-    if (replies.length) {
-      espLastSeen = Date.now();
-      return res.json(replies);
-    }
-
-    return res.status(204).end();
+    return replies.length
+      ? res.json(replies)
+      : res.status(204).end();
   }
 
   const reply = runRpcCall(body, req);
 
-  if (reply) {
-    espLastSeen = Date.now();
-    return res.json(reply);
-  }
-
-  return res.status(204).end();
+  return reply
+    ? res.json(reply)
+    : res.status(204).end();
 });
 
-// ---------- PIN verification ----------
+// --------------------------------------------------
+// DASHBOARD DOOR CONTROL
+// --------------------------------------------------
 
-function pinOk(req, res) {
-  const now = Date.now();
-
-  if (now < pinBlockedUntil) {
-    res.status(429).json({
-      ok: false,
-      error: "Too many wrong PINs. Try again in a minute.",
-    });
-
-    return false;
-  }
-
-  if (
-    DOOR_PIN &&
-    String((req.body || {}).pin || "") !== DOOR_PIN
-  ) {
-    wrongPins++;
-
-    if (wrongPins >= 5) {
-      pinBlockedUntil = now + 60000;
-      wrongPins = 0;
-    }
-
-    res.status(401).json({
-      ok: false,
-      error: "Wrong PIN",
-    });
-
-    return false;
-  }
-
-  wrongPins = 0;
-  return true;
-}
-
-// ---------- Dashboard door control ----------
-
-app.post("/api/door/open", (req, res) => {
+app.post("/api/door/open", async (req, res) => {
   if (!pinOk(req, res)) return;
 
   const now = Date.now();
@@ -582,469 +481,842 @@ app.post("/api/door/open", (req, res) => {
   if (!doorState(now).online) {
     return res.status(503).json({
       ok: false,
-      error: "The door lock is offline",
+      error: "The door lock is offline"
     });
   }
 
   door.requestedAt = now;
 
-  logActivity({
-    type: "dashboard",
+  await logActivity({
+    type: "dashboard"
   });
 
-  console.log(
-    "Door open requested from dashboard"
-  );
-
-  res.json({
-    ok: true,
-  });
+  res.json({ ok: true });
 });
 
-// ---------- Light and fan controls ----------
+// --------------------------------------------------
+// LIGHT AND FAN
+// --------------------------------------------------
 
 app.post("/api/switch/:name", (req, res) => {
-  const s = Object.hasOwn(switches, req.params.name)
+  const item = Object.hasOwn(switches, req.params.name)
     ? switches[req.params.name]
     : null;
 
   const on = (req.body || {}).on;
 
-  if (!s) {
+  if (!item) {
     return res.status(404).json({
       ok: false,
-      error: "Unknown switch",
+      error: "Unknown switch"
     });
   }
 
   if (typeof on !== "boolean") {
     return res.status(400).json({
       ok: false,
-      error: "on must be true or false",
+      error: "on must be true or false"
     });
   }
 
-  if (!devicesOnline(Date.now())) {
+  if (!devicesOnline()) {
     return res.status(503).json({
       ok: false,
-      error: `The ${s.label.toLowerCase()} is offline`,
+      error: `The ${item.label.toLowerCase()} is offline`
     });
   }
 
-  s.want = on;
+  item.want = on;
 
-  console.log(
-    `${s.label} turned ${on ? "on" : "off"} from dashboard`
-  );
-
-  res.json({
-    ok: true,
-  });
+  res.json({ ok: true });
 });
 
-// ---------- ESP32-CAM photo endpoint ----------
+// --------------------------------------------------
+// ESP32-CAM UPLOAD
+// --------------------------------------------------
 
 app.post(
   "/api/camera/photo",
+  cameraAuth,
   express.raw({
     type: "image/jpeg",
-    limit: "2mb",
+    limit: "2mb"
   }),
   async (req, res) => {
-
-    if (req.get("X-Camera-Key") !== CAMERA_KEY) {
-      return res.status(401).json({
-        ok: false,
-        error: "Wrong camera key",
-      });
-    }
-
-    if (
-      !Buffer.isBuffer(req.body) ||
-      !req.body.length
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Send the photo as image/jpeg",
-      });
-    }
-
-    if (!isFaceEngineReady()) {
-      return res.status(503).json({
-        ok: false,
-        error: "Face recognition is disabled on this server",
-      });
-    }
-
-    let descriptor;
-
     try {
-      descriptor = await faceEngine.describe(req.body);
-    } catch (err) {
-      return res.status(400).json({
-        ok: false,
-        error: "Could not read the photo",
-      });
-    }
-
-    const now = Date.now();
-
-    const visit = {
-      id: "",
-      time: now,
-      result: "no_face",
-      name: "",
-      descriptor,
-    };
-
-    let person = null;
-    let note = "no face in the photo";
-
-    if (descriptor) {
-      const closest = closestPerson(descriptor);
-
-      if (
-        closest &&
-        closest.distance < FACE_MATCH_THRESHOLD
-      ) {
-        person = closest.person;
-        visit.name = person.name;
-
-        if (devicesOnline(now)) {
-          door.requestedAt = now;
-          visit.result = "opened";
-        } else {
-          visit.result = "door_offline";
-        }
-      } else {
-        visit.result = "unknown";
+      if (!validJpeg(req.body)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid JPEG image"
+        });
       }
 
-      note = closest
-        ? `closest: ${closest.person.name} (${closest.distance.toFixed(2)})`
-        : "no faces registered";
+      const captureId = newId();
+      const storagePath = `${captureId}.jpg`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(ATTEMPTS_BUCKET)
+        .upload(storagePath, req.body, {
+          contentType: "image/jpeg",
+          upsert: false
+        });
+
+      if (uploadError) {
+        console.error("Camera photo upload:", uploadError.message);
+
+        return res.status(500).json({
+          ok: false,
+          error: "Could not save camera photo"
+        });
+      }
+
+      const capturedAt = new Date().toISOString();
+
+      const { data: attempt, error: dbError } = await supabase
+        .from("camera_attempts")
+        .insert({
+          capture_id: captureId,
+          image_path: storagePath,
+          result: "pending",
+          recognition_status: "pending",
+          captured_at: capturedAt
+        })
+        .select()
+        .single();
+
+      if (dbError) {
+        await supabase.storage
+          .from(ATTEMPTS_BUCKET)
+          .remove([storagePath]);
+
+        console.error("Camera record:", dbError.message);
+
+        return res.status(500).json({
+          ok: false,
+          error: "Could not create camera record"
+        });
+      }
+
+      await logActivity({
+        type: "pending",
+        photoPath: storagePath,
+        details: {
+          captureId,
+          attemptId: attempt.id
+        }
+      });
+
+      console.log("Camera photo queued:", captureId);
+
+      return res.json({
+        ok: true,
+        queued: true,
+        captureId
+      });
+    } catch (error) {
+      console.error("Camera upload error:", error.message);
+
+      return res.status(500).json({
+        ok: false,
+        error: "Camera upload failed"
+      });
     }
-
-    logActivity({
-      type:
-        visit.result === "opened"
-          ? "entered"
-          : visit.result,
-      name: visit.name,
-      personId: person ? person.id : null,
-      photo: true,
-    });
-
-    visit.id = activity[0].id;
-
-    fs.writeFileSync(
-      path.join(VISIT_PHOTO_DIR, visit.id + ".jpg"),
-      req.body
-    );
-
-    visits.unshift(visit);
-
-    if (visits.length > MAX_VISITS) {
-      visits.pop();
-    }
-
-    console.log(
-      `Door camera: ${visit.result} ${visit.name} (${note})`
-    );
-
-    res.json({
-      ok: true,
-      result: visit.result,
-      name: visit.name,
-    });
   }
 );
 
-// ---------- Save camera face ----------
+// --------------------------------------------------
+// REGISTER FIVE FACE PHOTOS
+// --------------------------------------------------
 
-app.post("/api/visits/:id/save", (req, res) => {
-  if (!pinOk(req, res)) return;
-
-  if (!isFaceEngineReady()) {
-    return res.status(503).json({
-      ok: false,
-      error: "Face recognition is disabled on this server",
-    });
-  }
-
-  const visit = visits.find(
-    (v) => v.id === req.params.id
-  );
-
-  const person = people.find(
-    (p) => p.id === (req.body || {}).personId
-  );
-
-  if (!visit || !visit.descriptor) {
-    return res.status(404).json({
-      ok: false,
-      error: "That photo is no longer available",
-    });
-  }
-
-  if (!person) {
-    return res.status(404).json({
-      ok: false,
-      error: "Choose a person",
-    });
-  }
-
-  person.descriptors.push(visit.descriptor);
-
-  savePeople();
-
-  res.json({
-    ok: true,
-  });
-});
-
-// ---------- Register a face ----------
+const FACE_ANGLES = [
+  "straight",
+  "left",
+  "right",
+  "up",
+  "down"
+];
 
 app.post("/api/faces", async (req, res) => {
   if (!pinOk(req, res)) return;
 
-  if (!isFaceEngineReady()) {
-    return res.status(503).json({
-      ok: false,
-      error: "Face recognition is disabled on this server",
-    });
-  }
+  try {
+    const body = req.body || {};
 
-  const body = req.body || {};
+    const name = toText(body.name).trim().slice(0, 40);
 
-  const name = toText(body.name)
-    .trim()
-    .slice(0, 40);
+    const images = Array.isArray(body.images)
+      ? body.images
+      : [];
 
-  const images = Array.isArray(body.images)
-    ? body.images.slice(0, 10)
-    : [];
-
-  if (!name) {
-    return res.status(400).json({
-      ok: false,
-      error: "Please type a name",
-    });
-  }
-
-  if (!images.length) {
-    return res.status(400).json({
-      ok: false,
-      error: "Take at least one photo",
-    });
-  }
-
-  const descriptors = [];
-  const failed = [];
-
-  for (let i = 0; i < images.length; i++) {
-    const jpegBuf = dataUrlToJpeg(images[i]);
-
-    let d = null;
-
-    try {
-      d = jpegBuf
-        ? await faceEngine.describe(jpegBuf)
-        : null;
-    } catch {
-      d = null;
+    if (!name) {
+      return res.status(400).json({
+        ok: false,
+        error: "Please type a name"
+      });
     }
 
-    if (d) {
-      descriptors.push(d);
-    } else {
-      failed.push(i);
+    if (images.length !== 5) {
+      return res.status(400).json({
+        ok: false,
+        error: "Exactly five face photos are required"
+      });
     }
-  }
 
-  if (failed.length) {
-    const error =
-      failed.length === images.length
-        ? "No face found in the photos. Make sure your face is well lit and fills the oval."
-        : "No face found in some photos. Please retake the ones marked in red.";
+    const buffers = images.map(dataUrlToJpeg);
 
-    return res.status(422).json({
-      ok: false,
-      error,
-      failed,
+    const failed = [];
+
+    buffers.forEach((buffer, index) => {
+      if (!buffer || !validJpeg(buffer)) {
+        failed.push(index);
+      }
     });
-  }
 
-  const others = [];
-
-  descriptors.forEach((d, i) => {
-    if (
-      i > 0 &&
-      faceEngine.distance(
-        descriptors[0],
-        d
-      ) > faceEngine.SAME_PERSON_DISTANCE
-    ) {
-      others.push(i);
+    if (failed.length) {
+      return res.status(422).json({
+        ok: false,
+        error: "Some photos are invalid. Please retake them.",
+        failed
+      });
     }
-  });
 
-  if (others.length) {
-    return res.status(422).json({
-      ok: false,
-      error: "Some photos look like a different person. Please retake them.",
-      failed: others,
-    });
-  }
+    const { data: existingPeople, error: peopleError } =
+      await supabase
+        .from("people")
+        .select("id,name");
 
-  let person = people.find(
-    (p) => p.name.toLowerCase() === name.toLowerCase()
-  );
+    if (peopleError) throw peopleError;
 
-  if (person) {
-    person.descriptors.push(...descriptors);
-  } else {
-    person = {
-      id: newId(),
-      name,
-      createdAt: Date.now(),
-      descriptors,
-    };
-
-    people.push(person);
-
-    fs.writeFileSync(
-      path.join(FACE_PHOTO_DIR, person.id + ".jpg"),
-      dataUrlToJpeg(images[0])
+    const existing = (existingPeople || []).find(
+      (person) =>
+        person.name.toLowerCase() === name.toLowerCase()
     );
+
+    if (existing) {
+      return res.status(409).json({
+        ok: false,
+        error: "A person with this name is already registered"
+      });
+    }
+
+    const { data: person, error: insertError } =
+      await supabase
+        .from("people")
+        .insert({
+          name,
+          sync_status: "pending"
+        })
+        .select()
+        .single();
+
+    if (insertError) throw insertError;
+
+    const uploadedPaths = [];
+    const photoRows = [];
+
+    for (let i = 0; i < buffers.length; i++) {
+      const angle = FACE_ANGLES[i];
+      const storagePath =
+        `${person.id}/${angle}_${Date.now()}.jpg`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(REGISTERED_BUCKET)
+        .upload(storagePath, buffers[i], {
+          contentType: "image/jpeg",
+          upsert: false
+        });
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      uploadedPaths.push(storagePath);
+
+      photoRows.push({
+        person_id: person.id,
+        storage_path: storagePath,
+        angle
+      });
+    }
+
+    const { error: photosError } = await supabase
+      .from("face_photos")
+      .insert(photoRows);
+
+    if (photosError) throw photosError;
+
+    await logActivity({
+      type: "registered",
+      personId: person.id,
+      name: person.name,
+      details: {
+        photoCount: 5
+      }
+    });
+
+    console.log("Face registration uploaded:", name);
+
+    return res.json({
+      ok: true,
+      id: person.id,
+      name: person.name,
+      photoCount: 5,
+      status: "pending"
+    });
+  } catch (error) {
+    console.error("Face registration error:", error.message);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Could not save registration. Please try again."
+    });
   }
-
-  savePeople();
-
-  console.log(
-    `Face saved: ${person.name}`
-  );
-
-  res.json({
-    ok: true,
-    id: person.id,
-    name: person.name,
-  });
 });
 
-// ---------- Delete a registered face ----------
+// --------------------------------------------------
+// DELETE REGISTERED PERSON
+// --------------------------------------------------
 
-app.delete("/api/faces/:id", (req, res) => {
+app.delete("/api/faces/:id", async (req, res) => {
   if (!pinOk(req, res)) return;
 
-  const person = people.find(
-    (p) => p.id === req.params.id
-  );
+  try {
+    const { data: photos, error: photoError } = await supabase
+      .from("face_photos")
+      .select("storage_path")
+      .eq("person_id", req.params.id);
 
-  if (!person) {
-    return res.status(404).json({
+    if (photoError) throw photoError;
+
+    const paths = (photos || []).map((photo) => photo.storage_path);
+
+    if (paths.length) {
+      const { error: storageError } = await supabase.storage
+        .from(REGISTERED_BUCKET)
+        .remove(paths);
+
+      if (storageError) throw storageError;
+    }
+
+    const { error: deleteError } = await supabase
+      .from("people")
+      .delete()
+      .eq("id", req.params.id);
+
+    if (deleteError) throw deleteError;
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Delete face error:", error.message);
+
+    res.status(500).json({
       ok: false,
-      error: "Not found",
+      error: "Could not delete this person"
     });
   }
-
-  people = people.filter(
-    (p) => p !== person
-  );
-
-  savePeople();
-
-  fs.rmSync(
-    path.join(FACE_PHOTO_DIR, person.id + ".jpg"),
-    { force: true }
-  );
-
-  res.json({
-    ok: true,
-  });
 });
 
-// ---------- Activity history ----------
+// --------------------------------------------------
+// LAPTOP AGENT: GET REGISTERED PEOPLE AND PHOTOS
+// --------------------------------------------------
+
+app.get(
+  "/api/agent/registrations",
+  agentAuth,
+  async (req, res) => {
+    try {
+      const { data: people, error: peopleError } = await supabase
+        .from("people")
+        .select("id,name,sync_status,created_at")
+        .order("created_at", { ascending: true });
+
+      if (peopleError) throw peopleError;
+
+      const result = [];
+
+      for (const person of people || []) {
+        const { data: photos, error: photosError } = await supabase
+          .from("face_photos")
+          .select("id,storage_path,angle")
+          .eq("person_id", person.id);
+
+        if (photosError) throw photosError;
+
+        const photoList = [];
+
+        for (const photo of photos || []) {
+          const url = await signedPhoto(
+            REGISTERED_BUCKET,
+            photo.storage_path
+          );
+
+          if (url) {
+            photoList.push({
+              id: photo.id,
+              angle: photo.angle,
+              url
+            });
+          }
+        }
+
+        result.push({
+          id: person.id,
+          name: person.name,
+          status: person.sync_status,
+          photos: photoList
+        });
+      }
+
+      res.set("Cache-Control", "no-store");
+
+      res.json({
+        ok: true,
+        people: result
+      });
+    } catch (error) {
+      console.error("Agent registration error:", error.message);
+
+      res.status(500).json({
+        ok: false,
+        error: "Could not load registrations"
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// LAPTOP AGENT: MARK REGISTRATION SYNCHRONIZED
+// --------------------------------------------------
+
+app.post(
+  "/api/agent/registrations/:id/synced",
+  agentAuth,
+  async (req, res) => {
+    const { error } = await supabase
+      .from("people")
+      .update({
+        sync_status: "synced",
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", req.params.id);
+
+    if (error) {
+      return res.status(500).json({
+        ok: false,
+        error: "Could not update registration status"
+      });
+    }
+
+    res.json({ ok: true });
+  }
+);
+
+// --------------------------------------------------
+// LAPTOP AGENT: CLAIM PENDING CAMERA CAPTURES
+// --------------------------------------------------
+
+app.get(
+  "/api/agent/captures",
+  agentAuth,
+  async (req, res) => {
+    try {
+      const limit = Math.min(
+        10,
+        Math.max(1, Number(req.query.limit) || 5)
+      );
+
+      const { data: attempts, error } = await supabase
+        .from("camera_attempts")
+        .select("*")
+        .eq("recognition_status", "pending")
+        .order("captured_at", { ascending: true })
+        .limit(limit);
+
+      if (error) throw error;
+
+      const captures = [];
+
+      for (const attempt of attempts || []) {
+        const url = await signedPhoto(
+          ATTEMPTS_BUCKET,
+          attempt.image_path
+        );
+
+        if (url) {
+          captures.push({
+            id: attempt.id,
+            captureId: attempt.capture_id,
+            url,
+            capturedAt: attempt.captured_at
+          });
+        }
+      }
+
+      res.set("Cache-Control", "no-store");
+
+      res.json({
+        ok: true,
+        captures
+      });
+    } catch (error) {
+      console.error("Agent capture queue:", error.message);
+
+      res.status(500).json({
+        ok: false,
+        error: "Could not load camera queue"
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// LAPTOP AGENT: SEND RECOGNITION RESULT
+// --------------------------------------------------
+
+app.post(
+  "/api/agent/captures/:id/result",
+  agentAuth,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+
+      const allowedResults = [
+        "entered",
+        "unknown",
+        "no_face",
+        "door_offline"
+      ];
+
+      if (!allowedResults.includes(body.result)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid recognition result"
+        });
+      }
+
+      let person = null;
+
+      if (body.personId) {
+        const { data, error } = await supabase
+          .from("people")
+          .select("id,name")
+          .eq("id", body.personId)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        person = data;
+
+        if (!person) {
+          return res.status(400).json({
+            ok: false,
+            error: "Registered person not found"
+          });
+        }
+      }
+
+      let result = body.result;
+
+      if (result === "entered") {
+        if (!person) {
+          return res.status(400).json({
+            ok: false,
+            error: "A person ID is required for an authorized result"
+          });
+        }
+
+        if (devicesOnline()) {
+          door.requestedAt = Date.now();
+        } else {
+          result = "door_offline";
+        }
+      }
+
+      const now = new Date().toISOString();
+
+      const { data: attempt, error: attemptError } =
+        await supabase
+          .from("camera_attempts")
+          .update({
+            person_id: person ? person.id : null,
+            person_name: person ? person.name : null,
+            result,
+            recognition_status: "completed",
+            recognized_at: now,
+            processed_at: now,
+            details: {
+              distance: toNumber(body.distance),
+              note: toText(body.note)
+            }
+          })
+          .eq("id", req.params.id)
+          .eq("recognition_status", "pending")
+          .select("id,image_path,captured_at")
+          .maybeSingle();
+
+      if (attemptError) throw attemptError;
+
+      if (!attempt) {
+        return res.status(409).json({
+          ok: false,
+          error: "Capture already processed or not found"
+        });
+      }
+
+      const { error: activityError } = await supabase
+        .from("activity_events")
+        .insert({
+          id: newId(),
+          event_type: result,
+          person_id: person ? person.id : null,
+          person_name: person ? person.name : "",
+          photo_path: attempt.image_path,
+          details: {
+            captureId: req.params.id,
+            distance: toNumber(body.distance),
+            note: toText(body.note)
+          },
+          created_at: now
+        });
+
+      if (activityError) throw activityError;
+
+      console.log(
+        `Laptop recognition: ${result} ${person ? person.name : ""}`
+      );
+
+      res.json({
+        ok: true,
+        result,
+        doorRequested: result === "entered"
+      });
+    } catch (error) {
+      console.error("Recognition result error:", error.message);
+
+      res.status(500).json({
+        ok: false,
+        error: "Could not save recognition result"
+      });
+    }
+  }
+);
+
+// --------------------------------------------------
+// ACTIVITY HISTORY
+// --------------------------------------------------
 
 const ACTIVITY_GROUPS = {
   entries: ["entered", "dashboard"],
-  unknown: ["unknown", "no_face"],
+  unknown: ["unknown", "no_face", "door_offline"]
 };
 
-app.get("/api/activity", (req, res) => {
-  const group = ACTIVITY_GROUPS[req.query.group];
+app.get("/api/activity", async (req, res) => {
+  try {
+    const group = ACTIVITY_GROUPS[req.query.group];
 
-  const person =
-    typeof req.query.person === "string"
-      ? req.query.person
-      : "";
+    const person =
+      typeof req.query.person === "string"
+        ? req.query.person
+        : "";
 
-  const before =
-    Number(req.query.before) || Infinity;
+    const limit = Math.min(
+      100,
+      Math.max(1, Number(req.query.limit) || 50)
+    );
 
-  const limit = Math.min(
-    100,
-    Math.max(1, Number(req.query.limit) || 50)
-  );
+    let query = supabase
+      .from("activity_events")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(limit + 1);
 
-  const list = activity.filter((a) =>
-    a.time < before &&
-    (!group || group.includes(a.type)) &&
-    (!person || a.personId === person)
-  );
+    if (group) {
+      query = query.in("event_type", group);
+    }
 
-  const midnight = new Date();
+    if (person) {
+      query = query.eq("person_id", person);
+    }
 
-  midnight.setHours(0, 0, 0, 0);
+    if (req.query.before) {
+      const beforeDate = new Date(Number(req.query.before));
 
-  const today = activity.filter(
-    (a) => a.time >= midnight.getTime()
-  );
+      if (!Number.isNaN(beforeDate.getTime())) {
+        query = query.lt("created_at", beforeDate.toISOString());
+      }
+    }
 
-  res.set("Cache-Control", "no-store");
+    const { data: events, error } = await query;
 
-  res.json({
-    items: list
-      .slice(0, limit)
-      .map(activityInfo),
+    if (error) throw error;
 
-    more: list.length > limit,
+    const selected = (events || []).slice(0, limit);
 
-    people: peopleList(),
+    const items = [];
 
-    today: {
-      entries: today.filter(
-        (a) => ACTIVITY_GROUPS.entries.includes(a.type)
-      ).length,
+    for (const event of selected) {
+      const photoUrl = await signedPhoto(
+        ATTEMPTS_BUCKET,
+        event.photo_path
+      );
 
-      unknown: today.filter(
-        (a) => ACTIVITY_GROUPS.unknown.includes(a.type)
-      ).length,
-    },
-  });
+      items.push({
+        id: event.id,
+        time: new Date(event.created_at).getTime(),
+        type: event.event_type,
+        name: event.person_name || "",
+        personId: event.person_id,
+        photo: photoUrl
+      });
+    }
+
+    const { data: people, error: peopleError } = await supabase
+      .from("people")
+      .select("id,name");
+
+    if (peopleError) throw peopleError;
+
+    const { data: allEvents, error: eventError } = await supabase
+      .from("activity_events")
+      .select("event_type,person_id,created_at");
+
+    if (eventError) throw eventError;
+
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+
+    const today = (allEvents || []).filter(
+      (event) => new Date(event.created_at) >= midnight
+    );
+
+    const peopleList = (people || []).map((p) => {
+      const entries = (allEvents || []).filter(
+        (event) =>
+          event.event_type === "entered" &&
+          event.person_id === p.id
+      );
+
+      return {
+        id: p.id,
+        name: p.name,
+        photos: 5,
+        entries: entries.length,
+        lastSeen: entries.length
+          ? new Date(entries[0].created_at).getTime()
+          : null
+      };
+    });
+
+    res.set("Cache-Control", "no-store");
+
+    res.json({
+      items,
+      more: (events || []).length > limit,
+      people: peopleList,
+      today: {
+        entries: today.filter(
+          (event) =>
+            ACTIVITY_GROUPS.entries.includes(event.event_type)
+        ).length,
+        unknown: today.filter(
+          (event) =>
+            ACTIVITY_GROUPS.unknown.includes(event.event_type)
+        ).length
+      }
+    });
+  } catch (error) {
+    console.error("Activity history error:", error.message);
+
+    res.status(500).json({
+      ok: false,
+      error: "Could not load activity history"
+    });
+  }
 });
 
-// ---------- Latest dashboard data ----------
+// --------------------------------------------------
+// LATEST DASHBOARD DATA
+// --------------------------------------------------
 
-app.get("/api/latest", (req, res) => {
-  const now = Date.now();
+app.get("/api/latest", async (req, res) => {
+  try {
+    const { data: people, error: peopleError } = await supabase
+      .from("people")
+      .select("id,name");
 
-  res.set("Cache-Control", "no-store");
+    if (peopleError) throw peopleError;
 
-  res.json({
-    latest,
-    door: doorState(now),
-    switches: switchStates(now),
-    faces: peopleList(),
-    visit: visitInfo(visits[0]),
-    activity: activity
-      .slice(0, 5)
-      .map(activityInfo),
-    serverTime: now,
-  });
+    const { data: events, error: eventsError } = await supabase
+      .from("activity_events")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    if (eventsError) throw eventsError;
+
+    const activity = [];
+
+    for (const event of events || []) {
+      activity.push({
+        id: event.id,
+        time: new Date(event.created_at).getTime(),
+        type: event.event_type,
+        name: event.person_name || "",
+        personId: event.person_id,
+        photo: await signedPhoto(
+          ATTEMPTS_BUCKET,
+          event.photo_path
+        )
+      });
+    }
+
+    const { data: lastAttempt, error: visitError } = await supabase
+      .from("camera_attempts")
+      .select("*")
+      .order("captured_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (visitError) throw visitError;
+
+    res.set("Cache-Control", "no-store");
+
+    res.json({
+      latest,
+      door: doorState(),
+      switches: switchStates(),
+      faces: (people || []).map((p) => ({
+        id: p.id,
+        name: p.name
+      })),
+      visit: lastAttempt
+        ? {
+            id: lastAttempt.id,
+            time: new Date(lastAttempt.captured_at).getTime(),
+            result: lastAttempt.result,
+            name: lastAttempt.person_name || "",
+            photo: await signedPhoto(
+              ATTEMPTS_BUCKET,
+              lastAttempt.image_path
+            )
+          }
+        : null,
+      activity,
+      serverTime: Date.now()
+    });
+  } catch (error) {
+    console.error("Latest data error:", error.message);
+
+    res.status(500).json({
+      ok: false,
+      error: "Could not load latest data"
+    });
+  }
 });
 
-// ---------- Dashboard pages ----------
+// --------------------------------------------------
+// DASHBOARD PAGES
+// --------------------------------------------------
 
 app.get("/", (req, res) => {
   const now = Date.now();
@@ -1059,24 +1331,20 @@ app.get("/", (req, res) => {
     live:
       latest !== null &&
       age < OFFLINE_AFTER_MS,
-
     door: doorState(now),
-
     switches: switchStates(now),
-
     switchLabels: Object.fromEntries(
       Object.entries(switches).map(
-        ([name, s]) => [name, s.label]
+        ([name, item]) => [name, item.label]
       )
     ),
-
-    pinRequired: DOOR_PIN !== "",
+    pinRequired: true
   });
 });
 
 app.get("/register", (req, res) => {
   res.render("register", {
-    pinRequired: DOOR_PIN !== "",
+    pinRequired: true
   });
 });
 
@@ -1084,7 +1352,9 @@ app.get("/history", (req, res) => {
   res.render("history");
 });
 
-// ---------- Health check ----------
+// --------------------------------------------------
+// HEALTH CHECK
+// --------------------------------------------------
 
 app.get("/health", (req, res) => {
   res.json({
@@ -1092,12 +1362,14 @@ app.get("/health", (req, res) => {
     server: "Smart Room",
     esp32Online: devicesOnline(),
     temperatureAvailable: latest !== null,
-    faceRecognitionEnabled: isFaceEngineReady(),
-    time: Date.now(),
+    faceRecognition: "Laptop agent",
+    time: Date.now()
   });
 });
 
-// ---------- Error handling ----------
+// --------------------------------------------------
+// ERROR HANDLING
+// --------------------------------------------------
 
 app.use((err, req, res, next) => {
   console.error("Server error:", err.message);
@@ -1109,62 +1381,47 @@ app.use((err, req, res, next) => {
         id: null,
         error: {
           code: -32700,
-          message: "Parse error",
-        },
+          message: "Parse error"
+        }
       });
     }
 
     return res.status(400).json({
       ok: false,
-      error: "Invalid JSON",
+      error: "Invalid JSON"
     });
   }
 
   if (err.type === "entity.too.large") {
     return res.status(413).json({
       ok: false,
-      error: "Request too large",
+      error: "Request too large"
     });
   }
 
   res.status(500).json({
     ok: false,
-    error: "Internal server error",
+    error: "Internal server error"
   });
 });
 
-// ---------- Start server ----------
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 
 const server = app.listen(PORT, HOST, () => {
-  console.log("");
   console.log("==================================");
   console.log(" Smart Room server is running");
   console.log("==================================");
-  console.log("");
-
-  console.log(`Port: ${PORT}`);
-  console.log(`Host: ${HOST}`);
-  console.log(`Face recognition enabled: ${isFaceEngineReady()}`);
-
-  console.log("");
-  console.log("ESP32 RPC endpoint:");
-  console.log("https://smart-room-exsy.onrender.com/rpc");
-
-  console.log("");
-  console.log("Dashboard:");
-  console.log("https://smart-room-exsy.onrender.com");
-
-  console.log("");
-  console.log("Health check:");
-  console.log("https://smart-room-exsy.onrender.com/health");
-
-  console.log("");
-  console.log("Waiting for ESP32 data...");
-  console.log("");
+  console.log("Port:", PORT);
+  console.log("Host:", HOST);
+  console.log("Face recognition: Laptop agent");
+  console.log("Dashboard: https://smart-room-exsy.onrender.com");
+  console.log("ESP32 RPC: https://smart-room-exsy.onrender.com/rpc");
+  console.log("Health: https://smart-room-exsy.onrender.com/health");
 });
 
-server.on("error", (err) => {
-  console.error("Server startup error:", err);
-
+server.on("error", (error) => {
+  console.error("Server startup error:", error);
   process.exit(1);
 });
