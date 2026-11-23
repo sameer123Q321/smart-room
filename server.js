@@ -197,10 +197,6 @@ async function updateOldFaces() {
 
 // Face recognition loads in the background - the rest of the server works meanwhile.
 // The first start on a new laptop downloads the models (about 190 MB).
-faceEngine.init()
-  .then(updateOldFaces)
-  .then(() => console.log("Face recognition ready."))
-  .catch((err) => console.error("Face recognition could not start:", err.message));
 
 // ---------- Setup ----------
 
@@ -691,8 +687,3 @@ server.on("error", (err) => {
   }
   process.exit(1);
 });
-
-faceEngine.init()
-  .then(updateOldFaces)
-  .then(() => console.log("Face recognition ready."))
-  .catch((err) => console.error("Face recognition could not start:", err.message));
