@@ -5,6 +5,7 @@ import json
 import getpass
 import logging
 from pathlib import Path
+from urllib import response
 
 import cv2
 import numpy as np
@@ -347,14 +348,18 @@ def send_result(capture, result, person_id=None,
         payload["distance"] = distance
 
     response = session.post(
-        f"{BASE_URL}/api/agent/captures/"
-        f"{capture['id']}/result",
-        json=payload,
-        timeout=30
-    )
+    f"{BASE_URL}/api/agent/captures/"
+    f"{capture['id']}/result",
+    json=payload,
+    timeout=30
+)
+
+    print("\n========== RENDER RESPONSE ==========")
+    print("Status:", response.status_code)
+    print("Message:", response.text)
+    print("====================================\n")
 
     response.raise_for_status()
-
     logging.info(
         "Result sent to Render: %s",
         result
@@ -499,12 +504,15 @@ def main():
 
     logging.info("Starting Smart Room Laptop Agent...")
 
+    # Synchronize registered faces only once at startup
     sync_registrations()
+
+    logging.info("Face database ready. Waiting for camera captures...")
 
     while True:
 
         try:
-            sync_registrations()
+            # Only check for new camera captures
             process_captures()
 
         except KeyboardInterrupt:

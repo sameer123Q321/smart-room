@@ -1,4 +1,4 @@
-/*
+ /*
   SMART ROOM - DOOR CAMERA (ESP32-CAM, AI-Thinker)
   Turn the switch ON -> the flash lights up -> look straight at the camera ->
   3 seconds later the photo is taken, the flash blinks 2 times, and the photo is
